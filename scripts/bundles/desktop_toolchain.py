@@ -127,10 +127,14 @@ def prepare_tools(source: Path, work: Path, cache: Path,
 
 def _msvc_identity() -> dict[str, str] | None:
     """The newest VC toolset vswhere reports, with its default tools version."""
-    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                   "Microsoft Visual Studio/Installer/vswhere.exe")
+    from hermes_platform.resolver import locate_command
+    from hermes_platform.resolver.known_dirs import visual_studio_installer_dirs
+
+    vswhere = locate_command("vswhere.exe", known_dirs=visual_studio_installer_dirs())
+    if not vswhere.found:
+        return None
     try:
-        result = subprocess.run([str(vswhere), "-latest", "-products", "*", "-requires",
+        result = subprocess.run([*vswhere.command, "-latest", "-products", "*", "-requires",
                                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-format", "json"],
                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                                 timeout=30, stdin=subprocess.DEVNULL, check=False)
