@@ -280,12 +280,12 @@ attempt installed from it is not upgrade-safe: every attempt of a version has
 the same package version, so the published build never replaces it. The Docker
 image is pushed early under the attempt ref; the `stable` and `latest` aliases
 move with the feed in the publication pass. The Store build follows the same
-rule: the green run uploads it as an uncommitted draft, and the publication
-pass commits that draft with auto-publish on, so it goes live as soon as
-certification passes. The submission API cannot release a submission once it
-is committed and held, which is why the commit waits for publication. A draft
-that does not carry the release's Store bundle (a newer green run replaced it)
-is left for that release's publication. A failed submission becomes a warning;
+rule: the green run commits it held (auto-publish off), so certification runs
+before the gate, and the publication pass switches that submission to
+auto-publish. If the submission API refuses the switch, the pass warns: select
+Publish now in Partner Center once the build is certified. A submission that
+does not carry the release's Store bundle (a newer green run replaced it) is
+left for that release's publication. A failed submission becomes a warning;
 the release still publishes. Stable channel
 records carry an optional `archiveRef` naming the attempt ref; `releaseTag`
 stays `vX.Y.Z` and the protected prefix falls back to it when `archiveRef` is

@@ -1,13 +1,14 @@
 """Store submission control for the release pipeline.
 
-The green run uploads the verified ``.msixbundle`` as a draft submission and
-stops: nothing a customer can see changes, and certification has not started.
-The publication pass, which runs only when the release really goes out, sets
-``targetPublishMode: "Immediate"`` on that draft and commits it, so the Store
-build goes live as soon as it passes certification. The submission API has no
-call that releases a submission once it is committed and held, which is why
-the commit waits for publication instead of happening at green with Manual.
-Both entry points are safe to rerun.
+The green run submits the verified ``.msixbundle`` with auto-publish off
+(``targetPublishMode: "Manual"``) and commits it, so certification runs before
+the release gate and nothing a customer sees changes. The publication pass,
+which runs only when the release really goes out, tries to switch that held
+submission to ``Immediate`` and commit it again so it goes live by itself.
+Microsoft documents no call that releases a held submission and does not say
+whether update accepts a committed one; when it refuses (409), publication
+prints a Publish now instruction instead, which is the manual step this
+replaces. Both entry points are safe to rerun.
 
 Green run — ``python -m scripts.releases.store submit <package>`` (Windows
 runner, ``msstore`` CLI configured beforehand by
@@ -21,6 +22,11 @@ runner, ``msstore`` CLI configured beforehand by
 3. ``msstore publish <package> --appId <productId> --noCommit`` — uploads the
    package and leaves the submission as a draft (``--noCommit`` / ``-nc``,
    "Disables committing the submission, keeping it in draft state").
+4. ``msstore submission get <productId>`` — the complete draft JSON.
+5. ``msstore submission update <productId> <json>`` — the same JSON with
+   ``targetPublishMode: "Manual"``. For MSIX apps ``submission update`` sends
+   the complete submission JSON, so it sets packages and publish mode at once.
+6. ``msstore submission publish <productId>`` — commits; certification starts.
 
 Publication pass — ``scripts.releases.store.release(...)`` (Ubuntu runner,
 Partner Center submission REST API, stdlib ``urllib`` only):
@@ -30,18 +36,18 @@ Partner Center submission REST API, stdlib ``urllib`` only):
    ``https://manage.devcenter.microsoft.com/.default`` (the same MS_STORE_*
    credentials the CLI uses).
 2. ``GET https://manage.devcenter.microsoft.com/v1.0/my/applications/{id}`` —
-   ``pendingApplicationSubmission.id`` names the draft.
-3. ``GET .../submissions/{id}`` — the draft must carry this release's Store
-   bundle (``applicationPackages[].fileName``); a draft from a newer green run
+   ``pendingApplicationSubmission.id`` names the held submission.
+3. ``GET .../submissions/{id}`` — it must carry this release's Store bundle
+   (``applicationPackages[].fileName``); a submission from a newer green run
    is left alone.
 4. ``PUT .../submissions/{id}`` with ``targetPublishMode: "Immediate"``, then
-   ``POST .../submissions/{id}/commit``; certification starts and the build
-   goes live when it passes. A submission that is already committed or live is
-   a no-op.
+   ``POST .../submissions/{id}/commit``. A 409 from either means the API will
+   not change a committed submission: publication warns with the Publish now
+   step and stays green. A live submission is a no-op.
 
 Sources for the commands and fields above:
-- msstore CLI commands and options (``submission get/delete --no-confirm``,
-  ``publish --noCommit``):
+- msstore CLI commands and options (``submission get/update/publish/delete
+  --no-confirm``, ``publish --noCommit``):
   https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/commands
 - CLI CI/CD setup (``msstore reconfigure --tenantId --sellerId --clientId
   --clientSecret`` on the runner):
@@ -56,7 +62,8 @@ Sources for the commands and fields above:
   https://learn.microsoft.com/en-us/windows/uwp/monetize/update-an-app-submission
   https://learn.microsoft.com/en-us/windows/uwp/monetize/commit-an-app-submission
   https://learn.microsoft.com/en-us/windows/uwp/monetize/get-status-for-an-app-submission
-  Update and commit refuse a submission that is no longer a draft (409).
+  Update documents 409 as "could not be updated because of the current state
+  of the app" without naming the states.
 - Azure AD client-credentials token:
   https://learn.microsoft.com/en-us/windows/uwp/monetize/create-and-manage-submissions-using-windows-store-services#obtain-an-azure-ad-access-token
 """
@@ -121,7 +128,7 @@ def _key(submission: dict, name: str) -> str | None:
 
 
 def submit(package: str, *, product_id: str, run=_cli_run) -> dict:
-    """Upload ``package`` as an uncommitted draft; the publication pass commits it."""
+    """Submit ``package`` held (auto-publish off) so certification runs before the gate."""
     status = _status(run(["msstore", "submission", "get", product_id]))
     if status == _DRAFT or status in _FAILED:
         run(["msstore", "submission", "delete", product_id, "--no-confirm"])
@@ -131,7 +138,12 @@ def submit(package: str, *, product_id: str, run=_cli_run) -> dict:
         raise StoreError(f"a committed Store submission is {status}; rerun stable-store "
                          "after it is published")
     run(["msstore", "publish", package, "--appId", product_id, "--noCommit"])
-    return {"productId": product_id, "status": _DRAFT}
+    submission = json.loads(run(["msstore", "submission", "get", product_id]))
+    submission[_key(submission, "targetPublishMode") or "TargetPublishMode"] = "Manual"
+    run(["msstore", "submission", "update", product_id,
+         json.dumps(submission, separators=(",", ":"))])
+    run(["msstore", "submission", "publish", product_id])
+    return {"productId": product_id, "targetPublishMode": "Manual"}
 
 
 def _http_run(request: dict) -> dict:
@@ -174,12 +186,16 @@ def _token(tenant_id: str, client_id: str, client_secret: str, run) -> str:
     return response["body"]["access_token"]
 
 
+class _Refused(StoreError):
+    """The submission API answered 409: it will not change this submission now."""
+
+
 def release(*, product_id: str, store_file: str, tenant_id: str, client_id: str,
             client_secret: str, run=_http_run) -> str:
-    """Commit this release's Store draft with ``targetPublishMode: "Immediate"``.
+    """Switch this release's held Store submission to ``Immediate`` and commit it.
 
     ``store_file`` is the Store bundle the release's candidate manifest names; a
-    draft that does not carry it belongs to another green run and is left alone.
+    submission that does not carry it belongs to another green run and is left alone.
     """
     token = _token(tenant_id, client_id, client_secret, run)
     auth = {"Authorization": f"Bearer {token}"}
@@ -189,6 +205,8 @@ def release(*, product_id: str, store_file: str, tenant_id: str, client_id: str,
         if body is not None:
             request["body"] = body
         response = run(request)
+        if response["status"] == 409 and method != "GET":
+            raise _Refused(f"{method} {path}: {response['body']}")
         if response["status"] != 200:
             raise StoreError(f"{method} {path} failed: {response['status']} {response['body']}")
         return response["body"]
@@ -196,8 +214,8 @@ def release(*, product_id: str, store_file: str, tenant_id: str, client_id: str,
     app = call("GET", f"/applications/{product_id}")
     pending = (app.get("pendingApplicationSubmission") or {}).get("id")
     if not pending:
-        _notice(f"No Store draft is pending for {product_id}; check the release's stable-store job.")
-        return "no-draft"
+        _notice(f"No Store submission is pending for {product_id}; check the release's stable-store job.")
+        return "no-submission"
     path = f"/applications/{product_id}/submissions/{pending}"
     submission = call("GET", path)
     state = submission.get(_key(submission, "status") or "status")
@@ -206,23 +224,29 @@ def release(*, product_id: str, store_file: str, tenant_id: str, client_id: str,
                 for package in packages)
     if state in _ALREADY_LIVE:
         return "already-live"
-    if state in _COMMITTED:
-        return "already-committed" if bound else "other-committed"
     if state in _FAILED:
         raise StoreError(f"Store submission {pending} is {state}; resubmit from a green run")
-    if state != _DRAFT:
+    if state != _DRAFT and state not in _COMMITTED:
         raise StoreError(f"Store submission {pending} has an unexpected status: {state!r}")
     if not bound:
-        _notice(f"The pending Store draft {pending} does not carry {store_file}; a newer "
-                "green run replaced it, and that release's publication commits it.")
+        _notice(f"The pending Store submission {pending} does not carry {store_file}; a newer "
+                "green run replaced it, and that release's publication releases it.")
         return "superseded"
-    submission[_key(submission, "targetPublishMode") or "targetPublishMode"] = "Immediate"
-    call("PUT", path, submission)
-    call("POST", f"{path}/commit")
+    mode_key = _key(submission, "targetPublishMode") or "targetPublishMode"
+    if submission.get(mode_key) == "Immediate" and state in _COMMITTED:
+        return "already-immediate"
+    submission[mode_key] = "Immediate"
+    try:
+        call("PUT", path, submission)
+        call("POST", f"{path}/commit")
+    except _Refused as refused:
+        _notice(f"Store submission {pending} stays held: the submission API refused to switch it "
+                f"to Immediate ({refused}). Once it is certified, select Publish now in Partner Center.")
+        return "held"
     after = call("GET", f"{path}/status").get("status")
     if after in _FAILED:
         raise StoreError(f"Store submission {pending} is {after} after commit")
-    return "committed"
+    return "immediate"
 
 
 def _notice(text: str) -> None:
@@ -240,7 +264,7 @@ def store_bundle(manifest: dict) -> str:
 
 
 def release_from_env(env: dict, manifest: dict, run=_http_run) -> str:
-    """Release the Store draft for ``manifest`` when the environment configures the Store."""
+    """Release the held Store submission for ``manifest`` when the environment configures the Store."""
     product_id = env.get("MS_STORE_PRODUCT_ID")
     if not product_id:
         print("Store release skipped: MS_STORE_PRODUCT_ID is not configured.",

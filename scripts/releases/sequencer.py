@@ -458,10 +458,11 @@ def reconcile(env: dict, *, run=output, read_head=None, advance_head=None,
                 docker.promote_stable(record["claim_tag"], record["docker_manifest_digest"], record["tag"])
                 log("Docker aliases moved")
             if "windows-store" in record["lanes"]:
-                log("Releasing the Microsoft Store draft")
+                log("Releasing the held Microsoft Store submission")
                 # The Store joins the pass here (after the feeds and aliases move): this
-                # release's draft is committed with auto-publish on. The Store never
-                # blocks a release: a failed or unreadable submission becomes a warning.
+                # release's held submission is switched to Immediate. The Store never
+                # blocks a release: a refused switch, a failed or an unreadable
+                # submission becomes a warning.
                 try:
                     raw = read_archive(f"releases/tag/{record['claim_tag']}/release-candidates.json")
                     if hashlib.sha256(raw).hexdigest() != record["candidate_manifest_sha256"]:
